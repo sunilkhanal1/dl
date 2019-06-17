@@ -1,0 +1,605 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Build a deep CNN model with adversarial loss for CIFAR-10"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<style>.container { width:80% !important; }</style>"
+      ],
+      "text/plain": [
+       "<IPython.core.display.HTML object>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "from IPython.core.display import display, HTML\n",
+    "display(HTML(\"<style>.container { width:80% !important; }</style>\"))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Using TensorFlow backend.\n"
+     ]
+    }
+   ],
+   "source": [
+    "from keras import backend as K\n",
+    "from keras.backend import gradients\n",
+    "from keras.layers import Input, Conv2D, Lambda, Flatten,Activation, Dense,Dropout, MaxPooling2D, Concatenate\n",
+    "from keras.layers.advanced_activations import LeakyReLU\n",
+    "from keras.models import Model\n",
+    "from keras.optimizers import Adam, rmsprop\n",
+    "from keras.regularizers import l2\n",
+    "from keras.layers.normalization import BatchNormalization"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import keras\n",
+    "from keras.datasets import cifar10\n",
+    "(x_train, y_train), (x_test, y_test) = cifar10.load_data()\n",
+    "\n",
+    "ntrain = 50000\n",
+    "ntest = 10000\n",
+    "\n",
+    "x_train = x_train.astype('float32')[:ntrain]\n",
+    "x_test = x_test.astype('float32')[:ntest]\n",
+    "x_train /= 255\n",
+    "x_test /= 255\n",
+    "\n",
+    "y_train = keras.utils.to_categorical(y_train, 10)[:ntrain]\n",
+    "y_test = keras.utils.to_categorical(y_test, 10)[:ntest]\n",
+    "\n",
+    "# https://www.cs.toronto.edu/~kriz/cifar.html\n",
+    "label_map = {0:'Airplane', 1:'Automobile', 2:'Bird', 3:'Cat', 4:'Deer', 5:'Dog', 6:'Frog', 7:'Horse', 8:'Ship', 9:'Truck'}\n",
+    "label_list = ['Airplane','Automobile','Bird','Cat','Deer','Dog','Frog','Horse','Ship','Truck']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(32, 32, 3)"
+      ]
+     },
+     "execution_count": 4,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "x_train[0].shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "<matplotlib.image.AxesImage at 0x7fa7b3bb2dd0>"
+      ]
+     },
+     "execution_count": 5,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "import matplotlib.pyplot as plt\n",
+    "plt.imshow(x_train[0])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_model(num_classes):\n",
+    "    image_input = Input(shape=(32, 32, 3))\n",
+    "    x = Conv2D(32, (3,3), padding='same')(image_input)\n",
+    "    x = Activation('relu')(x)\n",
+    "    x = Conv2D(32, (3,3))(x)\n",
+    "    x = Activation('relu')(x)\n",
+    "    x = MaxPooling2D(pool_size=(2, 2))(x)\n",
+    "    x = Dropout(0.25)(x)\n",
+    "    \n",
+    "    x = Conv2D(64, (3,3), padding='same')(x)\n",
+    "    x = Activation('relu')(x)\n",
+    "    x = Conv2D(64, (3,3))(x)\n",
+    "    x = Activation('relu')(x)\n",
+    "    x = MaxPooling2D(pool_size=(2, 2))(x)\n",
+    "    x = Dropout(0.25)(x)\n",
+    "    \n",
+    "    x = Flatten()(x)\n",
+    "    x = Dense(512)(x)\n",
+    "    x = Activation('relu')(x)\n",
+    "    x = Dropout(0.5)(x)\n",
+    "    x = Dense(num_classes)(x)\n",
+    "    y = Activation('softmax')(x)\n",
+    "    \n",
+    "    return Model(inputs=image_input, outputs=y)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Adversarial loss function, tensorboard visualization callback\n",
+    "\n",
+    "# Keras callback: https://github.com/keras-team/keras/blob/master/keras/callbacks.py#L942\n",
+    "# start tensorboard: tensorboard --logdir=/home/sunil_khanal/tf-logs --samples_per_plugin=images=100\n",
+    "# view tensorboard: http://localhost:6006/#images\n",
+    "\n",
+    "from time import time\n",
+    "from keras.callbacks import Callback, TensorBoard\n",
+    "\n",
+    "\n",
+    "import tensorflow as tf\n",
+    "import numpy as np\n",
+    "\n",
+    "epsilon = 0.05\n",
+    "alpha = 0.5\n",
+    "\n",
+    "def compute_gradient(tensor, var):\n",
+    "    gradients = tf.gradients(tensor, var)\n",
+    "    gradients = [gradient if gradient is not None else tf.zeros_like(var) for gradient in gradients]\n",
+    "    return gradients\n",
+    "\n",
+    "class AdversarialCallback(Callback):\n",
+    "    \"\"\"Callback to compute adversarially perturbed image and corresponding prediction\"\"\"\n",
+    "    def __init__(self, log_dir, model):\n",
+    "        super(AdversarialCallback, self).__init__()\n",
+    "        self.log_dir = log_dir\n",
+    "        self.file_writer = tf.summary.FileWriter(log_dir + \"/scalars\")\n",
+    "        self.model = model\n",
+    "    \n",
+    "    def set_model(self, model):\n",
+    "        print(\"setting up model\")\n",
+    "        self.model = model\n",
+    "        self.sess = K.get_session()\n",
+    "        \n",
+    "        self.x = tf.placeholder(tf.float32, shape=(1, 32, 32, 3), name=\"input_placeholder\")\n",
+    "        tf.summary.image('original_image', self.x, max_outputs=10)\n",
+    "        \n",
+    "        self.y_true = tf.placeholder(tf.float32, shape=(1, 10))\n",
+    "        label_index = tf.argmax(self.y_true, axis=1)[0]\n",
+    "        tf.summary.scalar(\"true_label_index\", label_index)\n",
+    "        \n",
+    "        self.true_label = tf.placeholder(tf.string, name=\"true_label_placeholder\")\n",
+    "        \n",
+    "        # label list to lookup with tensor index\n",
+    "        label_list_tf = tf.convert_to_tensor(label_list, dtype=tf.string)\n",
+    "               \n",
+    "        y_pred = self.model(self.x)\n",
+    "        pred_label_index = tf.argmax(y_pred, axis=1)[0]\n",
+    "        pred_label = label_list_tf[pred_label_index]\n",
+    "        \n",
+    "        loss = K.categorical_crossentropy(self.y_true, y_pred)\n",
+    "        gradients = compute_gradient(loss, self.x)\n",
+    "        gradient = gradients[0]\n",
+    "        tf.summary.image('image_gradient_sign', tf.sign(gradient))\n",
+    "        \n",
+    "        perturbed_image = self.x + K.variable(value=epsilon) * tf.sign(gradient) ## use sign of gradient\n",
+    "        tf.summary.image('perturbed_image', perturbed_image)\n",
+    "        \n",
+    "        adv_pred = self.model(perturbed_image)\n",
+    "        adv_label_index = tf.argmax(adv_pred, axis=1)[0]\n",
+    "        adv_label = label_list_tf[adv_label_index]\n",
+    "        \n",
+    "        labels = tf.strings.join([self.true_label, pred_label, adv_label], \",\")\n",
+    "        tf.summary.text(\"true_label-pred_label-adversarial_label\", labels)\n",
+    "        \n",
+    "        self.merged = tf.summary.merge_all()\n",
+    "    \n",
+    "    def on_epoch_end(self, epoch, logs=None):\n",
+    "        # reach min performance before logging metrics\n",
+    "        if epoch < 20:\n",
+    "            return\n",
+    "        \n",
+    "        val_data = self.validation_data\n",
+    "        #print(len(val_data)) # 4 elements\n",
+    "        #print(val_data[0].shape) # x\n",
+    "        #print(val_data[1].shape) # y\n",
+    "        #print(val_data[2].shape)\n",
+    "        #print(val_data[3])\n",
+    "        \n",
+    "        input_image = val_data[0][epoch]\n",
+    "        input_image = np.array([input_image], dtype=float)\n",
+    "        \n",
+    "        # feed true labels and pred labels\n",
+    "        true_label = val_data[1][epoch]\n",
+    "        true_label_index = np.argmax(true_label)\n",
+    "        true_label_string = label_map[true_label_index]\n",
+    "        \n",
+    "        feed_dict = {self.x: input_image, self.y_true: true_label.reshape((1,10)), self.true_label: true_label_string}\n",
+    "        ret = self.sess.run([self.merged], feed_dict=feed_dict)\n",
+    "        self.file_writer.add_summary(ret[0], epoch)\n",
+    "\n",
+    "def adversarial_loss(input_layer, model, tensorboard_writer=None):\n",
+    "    def loss(y_true, y_pred):\n",
+    "        return K.categorical_crossentropy(y_true, y_pred)\n",
+    "    \n",
+    "    def adv_loss(y_true, y_pred):\n",
+    "        reg_loss = loss(y_true, y_pred)\n",
+    "        \n",
+    "        # compute gradients and assign the first one\n",
+    "        gradients = K.gradients(reg_loss, input_layer)\n",
+    "        assert(len(gradients) == 1)\n",
+    "        gradient = gradients[0]\n",
+    "        \n",
+    "        # perturb image with the gradient\n",
+    "        image_perturb = input_layer + K.variable(value=epsilon) * tf.sign(gradient)\n",
+    "        \n",
+    "        # compute model output on the perturbed image and the loss\n",
+    "        adv_output = model(image_perturb)\n",
+    "        adv_gradient_loss = loss(y_true, adv_output)\n",
+    "        \n",
+    "        # combine and return losses, using alpha=0.5\n",
+    "        return alpha*reg_loss + (1 - alpha)*adv_gradient_loss \n",
+    "    \n",
+    "    return adv_loss"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Train with regular loss function\n",
+    "K.clear_session()\n",
+    "log_dir = \"/home/sunil_khanal/tf-logs/{}\".format(time())\n",
+    "\n",
+    "model = build_model(10)\n",
+    "model.compile(rmsprop(lr=0.0001, decay=1e-6), loss='categorical_crossentropy', metrics=['accuracy'])\n",
+    "callback = AdversarialCallback(log_dir, model)\n",
+    "model.fit(x_train, y_train, batch_size=32, epochs=20, validation_data=(x_test, y_test), verbose=1, callbacks=[callback])\n",
+    "model.save(\"cifar-10-regular-loss.h5\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train on 50000 samples, validate on 10000 samples\n",
+      "setting up model\n",
+      "Epoch 1/50\n",
+      "50000/50000 [==============================] - 31s 626us/step - loss: 2.0249 - acc: 0.3263 - val_loss: 1.9820 - val_acc: 0.4183\n",
+      "Epoch 2/50\n",
+      "50000/50000 [==============================] - 30s 593us/step - loss: 1.8425 - acc: 0.4348 - val_loss: 1.8460 - val_acc: 0.4891\n",
+      "Epoch 3/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.7645 - acc: 0.4819 - val_loss: 1.8305 - val_acc: 0.5051\n",
+      "Epoch 4/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.7134 - acc: 0.5125 - val_loss: 1.8137 - val_acc: 0.5288\n",
+      "Epoch 5/50\n",
+      "50000/50000 [==============================] - 30s 599us/step - loss: 1.6690 - acc: 0.5362 - val_loss: 1.7294 - val_acc: 0.5619\n",
+      "Epoch 6/50\n",
+      "50000/50000 [==============================] - 30s 595us/step - loss: 1.6351 - acc: 0.5559 - val_loss: 1.7186 - val_acc: 0.5720\n",
+      "Epoch 7/50\n",
+      "50000/50000 [==============================] - 30s 594us/step - loss: 1.6064 - acc: 0.5691 - val_loss: 1.7224 - val_acc: 0.5491\n",
+      "Epoch 8/50\n",
+      "50000/50000 [==============================] - 29s 583us/step - loss: 1.5751 - acc: 0.5803 - val_loss: 1.7105 - val_acc: 0.5970\n",
+      "Epoch 9/50\n",
+      "50000/50000 [==============================] - 30s 593us/step - loss: 1.5474 - acc: 0.5917 - val_loss: 1.6909 - val_acc: 0.5832\n",
+      "Epoch 10/50\n",
+      "50000/50000 [==============================] - 30s 595us/step - loss: 1.5219 - acc: 0.6021 - val_loss: 1.6376 - val_acc: 0.6175\n",
+      "Epoch 11/50\n",
+      "50000/50000 [==============================] - 30s 591us/step - loss: 1.4938 - acc: 0.6097 - val_loss: 1.5694 - val_acc: 0.6339\n",
+      "Epoch 12/50\n",
+      "50000/50000 [==============================] - 30s 591us/step - loss: 1.4671 - acc: 0.6172 - val_loss: 1.5828 - val_acc: 0.6093\n",
+      "Epoch 13/50\n",
+      "50000/50000 [==============================] - 30s 592us/step - loss: 1.4410 - acc: 0.6266 - val_loss: 1.5774 - val_acc: 0.6298\n",
+      "Epoch 14/50\n",
+      "50000/50000 [==============================] - 29s 587us/step - loss: 1.4103 - acc: 0.6339 - val_loss: 1.4723 - val_acc: 0.6565\n",
+      "Epoch 15/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.3863 - acc: 0.6413 - val_loss: 1.4524 - val_acc: 0.6606\n",
+      "Epoch 16/50\n",
+      "50000/50000 [==============================] - 29s 589us/step - loss: 1.3559 - acc: 0.6476 - val_loss: 1.4076 - val_acc: 0.6667\n",
+      "Epoch 17/50\n",
+      "50000/50000 [==============================] - 29s 588us/step - loss: 1.3311 - acc: 0.6578 - val_loss: 1.3496 - val_acc: 0.6843\n",
+      "Epoch 18/50\n",
+      "50000/50000 [==============================] - 30s 592us/step - loss: 1.3092 - acc: 0.6617 - val_loss: 1.3812 - val_acc: 0.6786\n",
+      "Epoch 19/50\n",
+      "50000/50000 [==============================] - 30s 592us/step - loss: 1.2884 - acc: 0.6655 - val_loss: 1.3229 - val_acc: 0.6820\n",
+      "Epoch 20/50\n",
+      "50000/50000 [==============================] - 30s 599us/step - loss: 1.2609 - acc: 0.6736 - val_loss: 1.2899 - val_acc: 0.6939\n",
+      "Epoch 21/50\n",
+      "50000/50000 [==============================] - 30s 590us/step - loss: 1.2456 - acc: 0.6761 - val_loss: 1.2741 - val_acc: 0.6939\n",
+      "Epoch 22/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.2263 - acc: 0.6805 - val_loss: 1.2665 - val_acc: 0.6893\n",
+      "Epoch 23/50\n",
+      "50000/50000 [==============================] - 30s 596us/step - loss: 1.2097 - acc: 0.6844 - val_loss: 1.2035 - val_acc: 0.7004\n",
+      "Epoch 24/50\n",
+      "50000/50000 [==============================] - 29s 584us/step - loss: 1.1976 - acc: 0.6898 - val_loss: 1.2077 - val_acc: 0.6951\n",
+      "Epoch 25/50\n",
+      "50000/50000 [==============================] - 30s 591us/step - loss: 1.1820 - acc: 0.6935 - val_loss: 1.2112 - val_acc: 0.7028\n",
+      "Epoch 26/50\n",
+      "50000/50000 [==============================] - 28s 567us/step - loss: 1.1770 - acc: 0.6988 - val_loss: 1.1754 - val_acc: 0.7015\n",
+      "Epoch 27/50\n",
+      "50000/50000 [==============================] - 29s 580us/step - loss: 1.1661 - acc: 0.6985 - val_loss: 1.1937 - val_acc: 0.7054\n",
+      "Epoch 28/50\n",
+      "50000/50000 [==============================] - 30s 591us/step - loss: 1.1555 - acc: 0.7022 - val_loss: 1.1563 - val_acc: 0.7153\n",
+      "Epoch 29/50\n",
+      "50000/50000 [==============================] - 30s 602us/step - loss: 1.1468 - acc: 0.7078 - val_loss: 1.1630 - val_acc: 0.7140\n",
+      "Epoch 30/50\n",
+      "50000/50000 [==============================] - 30s 596us/step - loss: 1.1389 - acc: 0.7061 - val_loss: 1.1442 - val_acc: 0.7231\n",
+      "Epoch 31/50\n",
+      "50000/50000 [==============================] - 29s 580us/step - loss: 1.1386 - acc: 0.7100 - val_loss: 1.1089 - val_acc: 0.7279\n",
+      "Epoch 32/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.1271 - acc: 0.7129 - val_loss: 1.1233 - val_acc: 0.7277\n",
+      "Epoch 33/50\n",
+      "50000/50000 [==============================] - 29s 588us/step - loss: 1.1201 - acc: 0.7159 - val_loss: 1.1733 - val_acc: 0.7197\n",
+      "Epoch 34/50\n",
+      "50000/50000 [==============================] - 30s 591us/step - loss: 1.1199 - acc: 0.7151 - val_loss: 1.1163 - val_acc: 0.7254\n",
+      "Epoch 35/50\n",
+      "50000/50000 [==============================] - 30s 592us/step - loss: 1.1117 - acc: 0.7170 - val_loss: 1.1124 - val_acc: 0.7278\n",
+      "Epoch 36/50\n",
+      "50000/50000 [==============================] - 30s 592us/step - loss: 1.1062 - acc: 0.7203 - val_loss: 1.1047 - val_acc: 0.7249\n",
+      "Epoch 37/50\n",
+      "50000/50000 [==============================] - 30s 604us/step - loss: 1.1052 - acc: 0.7211 - val_loss: 1.1601 - val_acc: 0.7148\n",
+      "Epoch 38/50\n",
+      "50000/50000 [==============================] - 29s 590us/step - loss: 1.1006 - acc: 0.7228 - val_loss: 1.0877 - val_acc: 0.7336\n",
+      "Epoch 39/50\n",
+      "50000/50000 [==============================] - 29s 576us/step - loss: 1.1007 - acc: 0.7227 - val_loss: 1.1427 - val_acc: 0.7248\n",
+      "Epoch 40/50\n",
+      "50000/50000 [==============================] - 30s 593us/step - loss: 1.0900 - acc: 0.7267 - val_loss: 1.1895 - val_acc: 0.7083\n",
+      "Epoch 41/50\n",
+      "50000/50000 [==============================] - 30s 596us/step - loss: 1.0906 - acc: 0.7273 - val_loss: 1.1937 - val_acc: 0.7178\n",
+      "Epoch 42/50\n",
+      "50000/50000 [==============================] - 29s 589us/step - loss: 1.0892 - acc: 0.7277 - val_loss: 1.1995 - val_acc: 0.7021\n",
+      "Epoch 43/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.0838 - acc: 0.7281 - val_loss: 1.0657 - val_acc: 0.7378\n",
+      "Epoch 44/50\n",
+      "50000/50000 [==============================] - 29s 584us/step - loss: 1.0780 - acc: 0.7311 - val_loss: 1.0800 - val_acc: 0.7403\n",
+      "Epoch 45/50\n",
+      "50000/50000 [==============================] - 29s 587us/step - loss: 1.0777 - acc: 0.7316 - val_loss: 1.1268 - val_acc: 0.7297\n",
+      "Epoch 46/50\n",
+      "50000/50000 [==============================] - 29s 590us/step - loss: 1.0737 - acc: 0.7337 - val_loss: 1.0807 - val_acc: 0.7374\n",
+      "Epoch 47/50\n",
+      "50000/50000 [==============================] - 30s 598us/step - loss: 1.0709 - acc: 0.7302 - val_loss: 1.0874 - val_acc: 0.7397\n",
+      "Epoch 48/50\n",
+      "50000/50000 [==============================] - 29s 587us/step - loss: 1.0686 - acc: 0.7354 - val_loss: 1.0491 - val_acc: 0.7409\n",
+      "Epoch 49/50\n",
+      "50000/50000 [==============================] - 30s 596us/step - loss: 1.0653 - acc: 0.7350 - val_loss: 1.1844 - val_acc: 0.7190\n",
+      "Epoch 50/50\n",
+      "50000/50000 [==============================] - 30s 606us/step - loss: 1.0628 - acc: 0.7368 - val_loss: 1.1935 - val_acc: 0.7148\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Train with adversarial loss function\n",
+    "K.clear_session()\n",
+    "log_dir = \"/home/sunil_khanal/tf-logs/{}\".format(time())\n",
+    "\n",
+    "model = build_model(10)\n",
+    "model.compile(rmsprop(lr=0.0001, decay=1e-6), loss=adversarial_loss(model.inputs[0], model), metrics=['accuracy'])\n",
+    "callback = AdversarialCallback(log_dir, model)\n",
+    "model.fit(x_train, y_train, batch_size=32, epochs=50, validation_data=(x_test, y_test), verbose=1, callbacks=[callback])\n",
+    "model.save(\"cifar-10-adversarial-loss.h5\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Load original and perturbed images"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 66,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Load the perturbed images and predict using the adversarially trained classifier\n",
+    "from PIL import Image\n",
+    "import os\n",
+    "\n",
+    "img_folder = \"/home/sunil_khanal/development/af-phishing/webpage_classifier/python/adversarial/images_cmp\"\n",
+    "\n",
+    "def load_image(filename):\n",
+    "    image = Image.open(os.path.join(img_folder, filename))\n",
+    "    return np.array([np.array(image)/255.])\n",
+    "\n",
+    "dog_dog_frog_original = load_image(\"dog_dog_frog_image.png\")\n",
+    "horse_horse_cat_original = load_image(\"horse_horse_cat_image.png\")\n",
+    "ship_ship_truck_original = load_image(\"ship_ship_truck_image.png\")\n",
+    "truck_truck_automobile_original = load_image(\"truck_truck_automobile_image.png\")\n",
+    "dog_dog_cat_original = load_image(\"dog_dog_cat_image.png\")\n",
+    "\n",
+    "dog_dog_frog_perturbed = load_image(\"dog_dog_frog_perturbed.png\")\n",
+    "horse_horse_cat_perturbed = load_image(\"horse_horse_cat_perturbed.png\")\n",
+    "ship_ship_truck_perturbed = load_image(\"ship_ship_truck_perturbed.png\")\n",
+    "truck_truck_automobile_perturbed = load_image(\"truck_truck_automobile_perturbed.png\")\n",
+    "dog_dog_cat_perturbed = load_image(\"dog_dog_cat_perturbed.png\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Load regular and adversarially trained models"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 67,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from keras.models import load_model\n",
+    "from keras.utils.generic_utils import get_custom_objects\n",
+    "\n",
+    "# This is not adversarial loss, used as placeholder for loading model\n",
+    "def adv_loss(y_true, y_pred):\n",
+    "    return K.categorical_crossentropy(y_true, y_pred)\n",
+    "get_custom_objects().update({\"adv_loss\": adv_loss})\n",
+    "\n",
+    "def predict(model, data):\n",
+    "    preds = model.predict(data)\n",
+    "    index = np.argmax(preds)\n",
+    "    print(label_map[index])\n",
+    "\n",
+    "adversarial_model = load_model(\"/home/sunil_khanal/development/af-phishing/webpage_classifier/python/adversarial/cifar-10-adversarial-loss.h5\")\n",
+    "regular_model = load_model(\"/home/sunil_khanal/development/af-phishing/webpage_classifier/python/adversarial/cifar-10-regular-loss.h5\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Predict original images using regular model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 68,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Dog\n",
+      "Horse\n",
+      "Ship\n",
+      "Truck\n",
+      "Dog\n"
+     ]
+    }
+   ],
+   "source": [
+    "predict(regular_model, dog_dog_frog_original)\n",
+    "predict(regular_model, horse_horse_cat_original)\n",
+    "predict(regular_model, ship_ship_truck_original)\n",
+    "predict(regular_model, truck_truck_automobile_original)\n",
+    "predict(regular_model, dog_dog_cat_original)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Predict perturbed images using regular model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 69,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Deer\n",
+      "Cat\n",
+      "Ship\n",
+      "Automobile\n",
+      "Cat\n"
+     ]
+    }
+   ],
+   "source": [
+    "predict(regular_model, dog_dog_frog_perturbed)\n",
+    "predict(regular_model, horse_horse_cat_perturbed)\n",
+    "predict(regular_model, ship_ship_truck_perturbed)\n",
+    "predict(regular_model, truck_truck_automobile_perturbed)\n",
+    "predict(regular_model, dog_dog_cat_perturbed)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Predict perturbed images using adversarial model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 70,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Dog\n",
+      "Horse\n",
+      "Ship\n",
+      "Truck\n",
+      "Dog\n"
+     ]
+    }
+   ],
+   "source": [
+    "predict(adversarial_model, dog_dog_frog_perturbed)\n",
+    "predict(adversarial_model, horse_horse_cat_perturbed)\n",
+    "predict(adversarial_model, ship_ship_truck_perturbed)\n",
+    "predict(adversarial_model, truck_truck_automobile_perturbed)\n",
+    "predict(adversarial_model, dog_dog_cat_perturbed)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 2",
+   "language": "python",
+   "name": "python2"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 2
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython2",
+   "version": "2.7.16"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
